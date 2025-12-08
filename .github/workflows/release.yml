@@ -254,7 +254,7 @@ jobs:
       - build-lsp-server
       - update-version
     steps:
-      - uses: huacnlee/zed-extension-action@v1
+      - uses: huacnlee/zed-extension-action@v2
         with:
           extension-name: phpmd
           push-to: GeneaLabs/extensions
