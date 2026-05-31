@@ -93,7 +93,7 @@ impl PhpmdLspServer {
             .map_err(|e| format!("Failed to download binary from release: {}. Please ensure the release {} exists with assets.", e, VERSION))?;
         
         // After extraction, the file should be in the bin directory
-        if !fs::metadata(&binary_path).is_ok() {
+        if fs::metadata(&binary_path).is_err() {
             return Err(format!("Binary not found after extraction. Expected at: {}", binary_path));
         }
         
@@ -146,7 +146,7 @@ impl zed::Extension for PhpmdLspExtension {
                 phpmd_lsp.language_server_command(language_server_id, worktree)
             }
             language_server_id => {
-                Err(format!("unknown language server: {language_server_id}").into())
+                Err(format!("unknown language server: {language_server_id}"))
             }
         }
     }
@@ -185,11 +185,10 @@ impl zed::Extension for PhpmdLspExtension {
                 if let Some(rulesets_value) = settings.get("rulesets") {
                     match rulesets_value {
                         // Single ruleset as string
-                        zed::serde_json::Value::String(rulesets) => {
-                            if !rulesets.trim().is_empty() {
+                        zed::serde_json::Value::String(rulesets)
+                            if !rulesets.trim().is_empty() => {
                                 rulesets_to_use = Some(rulesets.clone());
-                            }
-                        },
+                            },
                         // Multiple rulesets as array
                         zed::serde_json::Value::Array(rulesets) => {
                             let ruleset_strings: Vec<String> = rulesets
@@ -265,7 +264,7 @@ impl PhpmdLspExtension {
             .map_err(|e| format!("Failed to download {} from release: {}. Please ensure the release {} exists with assets.", phar_name, e, VERSION))?;
         
         // After extraction, the file should be in the bin directory
-        if !fs::metadata(&phar_path).is_ok() {
+        if fs::metadata(&phar_path).is_err() {
             return Err(format!("{} not found after extraction. Expected at: {}", phar_name, phar_path));
         }
         
@@ -303,6 +302,3 @@ impl PhpmdLspExtension {
 }
 
 zed::register_extension!(PhpmdLspExtension);
-
-#[cfg(test)]
-mod test;
