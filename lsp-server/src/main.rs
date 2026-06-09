@@ -913,7 +913,7 @@ impl PhpmdLanguageServer {
                                 if let Some(actual_line) =
                                     self.find_property_line(property_name, &content)
                                 {
-                                    eprintln!("✅ PHPMD LSP: Found actual property line {} for ${} (was reported as {})", 
+                                    eprintln!("✅ PHPMD LSP: Found actual property line {} for ${} (was reported as {})",
                                         actual_line, property_name, begin_line);
                                     return (actual_line, actual_line);
                                 }
@@ -1133,7 +1133,7 @@ impl PhpmdLanguageServer {
             },
         };
 
-        eprintln!("📐 PHPMD LSP: [{}] Final LSP Range - start: (line: {}, char: {}), end: (line: {}, char: {})", 
+        eprintln!("📐 PHPMD LSP: [{}] Final LSP Range - start: (line: {}, char: {}), end: (line: {}, char: {})",
             file_name, lsp_begin_line, start_char, lsp_end_line, end_char);
 
         // Store additional data for potential future features
@@ -1159,12 +1159,22 @@ impl PhpmdLanguageServer {
             related_information: None,
             tags: None,
             code_description: if !rule_set.is_empty() {
+                let ruleset_slug = rule_set
+                    .to_lowercase()
+                    .replace(" ", "")
+                    .trim_end_matches("rules")
+                    .to_string();
+                let url_str = if !rule.is_empty() {
+                    format!(
+                        "https://phpmd.org/rules/{}.html#{}",
+                        ruleset_slug,
+                        rule.to_lowercase()
+                    )
+                } else {
+                    format!("https://phpmd.org/rules/{}.html", ruleset_slug)
+                };
                 Some(CodeDescription {
-                    href: Url::parse(&format!(
-                        "https://phpmd.org/rules/{}.html",
-                        rule_set.to_lowercase().replace(" ", "")
-                    ))
-                    .ok()?,
+                    href: Url::parse(&url_str).ok()?,
                 })
             } else {
                 None
@@ -1585,7 +1595,7 @@ impl LanguageServer for PhpmdLanguageServer {
                         // Validate cache is still valid by checking content checksum
                         if let Some(ref checksum) = current_checksum {
                             if cached.content_checksum != *checksum {
-                                eprintln!("🔄 PHPMD LSP: Cache invalidated for {} - content changed (old: {}, new: {})", 
+                                eprintln!("🔄 PHPMD LSP: Cache invalidated for {} - content changed (old: {}, new: {})",
                                     file_name, &cached.content_checksum[..8], &checksum[..8]);
                                 // Content has changed, need to re-analyze
                                 drop(cache); // Release read lock before we try to write
