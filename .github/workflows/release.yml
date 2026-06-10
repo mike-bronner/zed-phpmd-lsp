@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
         new_version: ${{ steps.extract_version.outputs.version }}
+        new_commit_sha: ${{ steps.commit_changes.outputs.new_commit_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -34,8 +35,9 @@ jobs:
       - name: Extract version from release tag
         id: extract_version
         run: |
+          # Release event provides tag_name; workflow_dispatch provides inputs.tag
           # Remove 'v' prefix if present (e.g., v1.2.3 -> 1.2.3)
-          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${{ github.event.release.tag_name || github.event.inputs.tag }}"
           VERSION="${VERSION#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Extracted version: ${VERSION}"
@@ -168,7 +170,12 @@ jobs:
             binary_name: phpmd-lsp-server-windows-arm64.exe
 
     steps:
+      # Pin to the version-bump commit: update-version force-moves the release
+      # tag, and a bare checkout of the moved tag fails actions/checkout's
+      # expected-commit validation.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.update-version.outputs.new_commit_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -235,9 +242,13 @@ jobs:
   download-phars:
     name: Download and Package PHAR Files
     runs-on: ubuntu-latest
+    needs: update-version
 
     steps:
+      # Pin to the version-bump commit — same race as build-lsp-server.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.update-version.outputs.new_commit_sha }}
 
       - name: Download PHPMD
         run: |
