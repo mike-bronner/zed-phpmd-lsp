@@ -749,7 +749,7 @@ impl PhpmdLanguageServer {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("❌ PHPMD LSP: Failed to parse JSON output: {}", e);
-                eprintln!("Raw output: {}", json_output);
+                eprintln!("Raw output: {}", truncate_for_log(json_output, 500));
                 return Ok(vec![]);
             }
         };
