@@ -617,11 +617,7 @@ impl PhpmdLanguageServer {
         let raw_output = String::from_utf8_lossy(&output.stdout);
 
         // Debug: Show raw PHPMD output (first 500 chars)
-        let output_preview = if raw_output.len() > 500 {
-            format!("{}...", &raw_output[..500])
-        } else {
-            raw_output.to_string()
-        };
+        let output_preview = truncate_for_log(&raw_output, 500);
         eprintln!(
             "🔬 PHPMD LSP: Raw PHPMD output for {}: {}",
             file_name, output_preview
