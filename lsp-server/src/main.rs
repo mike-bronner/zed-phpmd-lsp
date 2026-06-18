@@ -102,6 +102,18 @@ fn error_control_operator_start_char(line_content: &str) -> usize {
     }
 }
 
+/// Truncate a line to at most `max` characters for debug logging, appending an
+/// ellipsis when the line is longer. Truncation happens on character
+/// boundaries (not byte indices), so lines containing multi-byte UTF-8 (accents,
+/// CJK, emoji) never panic the way a raw `&line[..max]` byte slice would.
+fn truncate_for_log(line: &str, max: usize) -> String {
+    if line.chars().count() > max {
+        format!("{}...", line.chars().take(max).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 impl PhpmdLanguageServer {
     fn new(client: Client) -> Self {
         Self {
@@ -1128,13 +1140,7 @@ impl PhpmdLanguageServer {
                     if (effective_begin_line as usize) <= lines.len() && effective_begin_line > 0 {
                         let phpmd_line_content = lines
                             .get((effective_begin_line - 1) as usize)
-                            .map(|l| {
-                                if l.len() > 80 {
-                                    format!("{}...", &l[..80])
-                                } else {
-                                    l.to_string()
-                                }
-                            })
+                            .map(|l| truncate_for_log(l, 80))
                             .unwrap_or_else(|| "LINE NOT FOUND".to_string());
                         eprintln!(
                             "📍 PHPMD LSP: [{}] Content at PHPMD line {}: {:?}",
@@ -1960,5 +1966,41 @@ mod tests {
         let line = "        $handle = gzopen($path, 'wb9');";
         // 8 leading spaces, then the first non-whitespace character.
         assert_eq!(error_control_operator_start_char(line), 8);
+    }
+
+    #[test]
+    fn truncate_for_log_leaves_short_lines_untouched() {
+        let line = "$handle = @gzopen($path, 'wb9');";
+        assert_eq!(truncate_for_log(line, 80), line.to_string());
+    }
+
+    #[test]
+    fn truncate_for_log_appends_ellipsis_when_too_long() {
+        let line = "x".repeat(120);
+        let result = truncate_for_log(&line, 80);
+        assert_eq!(result, format!("{}...", "x".repeat(80)));
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_multibyte_at_byte_boundary() {
+        // Regression for the `&line[..80]` byte slice: this line is 81 bytes
+        // ("a" + 40 × "é"), so the old byte-length guard (`len() > 80`) fired,
+        // but byte index 80 falls in the middle of the final "é" — not a char
+        // boundary — which panicked the LSP server. The char count (41) is
+        // ≤ 80, so the line should be returned in full without truncation.
+        let line = format!("a{}", "é".repeat(40));
+        assert!(line.len() > 80, "fixture must exceed 80 bytes");
+        assert!(line.chars().count() <= 80, "fixture must be ≤ 80 chars");
+        assert_eq!(truncate_for_log(&line, 80), line);
+    }
+
+    #[test]
+    fn truncate_for_log_truncates_multibyte_on_char_boundary() {
+        // 100 multi-byte chars (200 bytes): char count > 80, so it truncates.
+        // The result must be valid UTF-8 cut on a char boundary, not a byte one.
+        let line = "é".repeat(100);
+        let result = truncate_for_log(&line, 80);
+        assert_eq!(result, format!("{}...", "é".repeat(80)));
+        assert_eq!(result.chars().count(), 83); // 80 chars + "..."
     }
 }
