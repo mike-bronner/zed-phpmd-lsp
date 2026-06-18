@@ -92,13 +92,31 @@ fn error_control_operator_range(description: &str, begin_line: u32) -> (u32, u32
     }
 }
 
+/// Convert a UTF-8 byte offset within `s` into the corresponding LSP
+/// `Position.character` value: a count of UTF-16 code units. The LSP spec
+/// (3.17 §3.1) defines character positions in UTF-16 code units absent a
+/// negotiated `positionEncoding`, so a raw byte offset mis-places the column on
+/// any line containing non-ASCII content before `byte_pos` (accented
+/// identifiers, CJK, emoji in a comment).
+///
+/// `byte_pos` must fall on a UTF-8 char boundary of `s`; every call site passes
+/// a `find`/`trim_start`/`len`-derived offset, all of which are boundaries.
+fn utf16_offset(s: &str, byte_pos: usize) -> u32 {
+    s[..byte_pos].encode_utf16().count() as u32
+}
+
 /// Locate the column at which the `@` operator begins on the given line so the
 /// squiggle underlines the operator token rather than the leading whitespace.
 /// Falls back to the first non-whitespace column when the line contains no `@`.
-fn error_control_operator_start_char(line_content: &str) -> usize {
+/// The returned value is a UTF-16 code-unit offset (LSP `Position.character`),
+/// not a byte offset.
+fn error_control_operator_start_char(line_content: &str) -> u32 {
     match line_content.find('@') {
-        Some(offset) => offset,
-        None => line_content.len() - line_content.trim_start().len(),
+        Some(byte_offset) => utf16_offset(line_content, byte_offset),
+        None => utf16_offset(
+            line_content,
+            line_content.len() - line_content.trim_start().len(),
+        ),
     }
 }
 
@@ -1153,24 +1171,28 @@ impl PhpmdLanguageServer {
                         let start_char = if rule == "ErrorControlOperator" {
                             error_control_operator_start_char(start_line_content)
                         } else {
-                            start_line_content.len() - start_line_content.trim_start().len()
+                            utf16_offset(
+                                start_line_content,
+                                start_line_content.len() - start_line_content.trim_start().len(),
+                            )
                         };
 
-                        // Calculate end character position
+                        // Calculate end character position (UTF-16 code units)
                         let end_char = if lsp_begin_line == lsp_end_line {
                             // Same line - use the actual line length
-                            start_line_content.len()
+                            utf16_offset(start_line_content, start_line_content.len())
                         } else if (effective_end_line as usize) <= lines.len()
                             && effective_end_line > 0
                         {
                             // Different end line - get its actual length
-                            lines[(effective_end_line - 1) as usize].len()
+                            let end_line_content = lines[(effective_end_line - 1) as usize];
+                            utf16_offset(end_line_content, end_line_content.len())
                         } else {
                             // Fallback to large number if line not found
                             999
                         };
 
-                        (start_char as u32, end_char as u32)
+                        (start_char, end_char)
                     } else {
                         (0, 999)
                     }
@@ -1953,8 +1975,20 @@ mod tests {
     #[test]
     fn start_char_anchors_at_the_at_operator() {
         let line = "        $handle = @gzopen($path, 'wb9');";
-        let at_offset = line.find('@').unwrap();
-        assert_eq!(error_control_operator_start_char(line), at_offset);
+        // All-ASCII line: the `@` sits at column 18 (8 spaces + "$handle = "),
+        // where the UTF-16 code-unit offset equals the byte offset.
+        assert_eq!(line.find('@'), Some(18), "fixture: @ is at byte 18");
+        assert_eq!(error_control_operator_start_char(line), 18);
+    }
+
+    #[test]
+    fn start_char_anchors_at_the_at_operator_with_non_ascii_prefix() {
+        // "é" is 2 UTF-8 bytes but a single UTF-16 code unit, so the byte
+        // offset of `@` (11) differs from its UTF-16 offset (10). LSP wants the
+        // UTF-16 value — this is the regression the byte-offset bug produced.
+        let line = "  $café = @gzopen();";
+        assert_eq!(line.find('@'), Some(11), "fixture: @ is at byte 11");
+        assert_eq!(error_control_operator_start_char(line), 10);
     }
 
     #[test]
@@ -1962,6 +1996,27 @@ mod tests {
         let line = "        $handle = gzopen($path, 'wb9');";
         // 8 leading spaces, then the first non-whitespace character.
         assert_eq!(error_control_operator_start_char(line), 8);
+    }
+
+    #[test]
+    fn start_char_fallback_counts_utf16_code_units_for_non_ascii_whitespace() {
+        // A non-breaking space (U+00A0, 2 UTF-8 bytes, 1 UTF-16 code unit)
+        // precedes the first ASCII space, so the leading-whitespace byte length
+        // (3) differs from its UTF-16 length (2). No `@` ⇒ fallback branch.
+        let line = "\u{00A0} café();";
+        assert_eq!(line.find('@'), None, "fixture must have no @");
+        assert_eq!(error_control_operator_start_char(line), 2);
+    }
+
+    #[test]
+    fn utf16_offset_counts_code_units_not_bytes() {
+        // "café" is 5 bytes ("c","a","f","é"=2) but 4 UTF-16 code units.
+        let s = "café = 1;";
+        assert_eq!(utf16_offset(s, "café".len()), 4);
+        // An astral-plane char (emoji) is 4 UTF-8 bytes and 2 UTF-16 code units
+        // (a surrogate pair), so the count must exceed the char count.
+        let s = "🦀x";
+        assert_eq!(utf16_offset(s, "🦀".len()), 2);
     }
 
     #[test]
