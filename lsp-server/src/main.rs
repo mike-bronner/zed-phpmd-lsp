@@ -2054,4 +2054,134 @@ mod tests {
         assert_eq!(result, format!("{}...", "é".repeat(80)));
         assert_eq!(result.chars().count(), 83); // 80 chars + "..."
     }
+
+    // ── End-to-end coverage for convert_violation_to_diagnostic ──────────
+    //
+    // The position-conversion logic at the diagnostic-builder sites — the
+    // non-`ErrorControlOperator` `start_char` branch and both `end_char`
+    // branches — is exercised here through the real async method, not just
+    // through the `utf16_offset` helper it delegates to. This pins the
+    // *wiring* (which line feeds `end_char`, which branch computes
+    // `start_char`), so a future refactor that picks the wrong line or
+    // reintroduces a raw byte offset at one of these sites is caught.
+
+    /// Construct a `PhpmdLanguageServer` wired to a real (but unconnected)
+    /// `tower-lsp` client and seed `open_docs` with `content` under `uri`.
+    ///
+    /// `tower-lsp`'s `Client` has no public constructor, so the only supported
+    /// way to mint one is through `LspService::new`, which hands the backend a
+    /// live client; we then borrow the backend back out via `inner()` and
+    /// clone it (every field is an `Arc`, so the clone shares `open_docs`).
+    /// The conversion path never calls the client — it only *reads*
+    /// `open_docs` — so dropping the unread socket here is harmless.
+    fn server_with_doc(uri: &Url, content: &str) -> PhpmdLanguageServer {
+        let (service, _socket) = LspService::new(PhpmdLanguageServer::new);
+        let server = service.inner().clone();
+        let compressed = server.compress_document(content);
+        server
+            .open_docs
+            .write()
+            .unwrap()
+            .insert(uri.clone(), compressed);
+        server
+    }
+
+    /// Build a minimal PHPMD violation. `rule` drives the range logic; the
+    /// tests below pass a generic rule so the non-`ErrorControlOperator`
+    /// `start_char` branch is the one under test.
+    fn violation(begin_line: u32, end_line: u32, rule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "beginLine": begin_line,
+            "endLine": end_line,
+            "description": "test violation",
+            "rule": rule,
+            "ruleSet": "Code Size Rules",
+            "priority": 3,
+        })
+    }
+
+    #[tokio::test]
+    async fn same_line_end_char_is_utf16_length_not_byte_length() {
+        // Single-line violation (beginLine == endLine) on a line whose `é`
+        // makes its byte length (10) exceed its UTF-16 length (9). The
+        // same-line `end_char` branch must report 9 — the UTF-16 code-unit
+        // count — so the squiggle ends at the line's true end rather than two
+        // columns past it.
+        let uri = Url::parse("file:///test.php").unwrap();
+        let line = "  café();";
+        assert_eq!(line.len(), 10, "fixture: 10 bytes (é is 2)");
+        assert_eq!(line.encode_utf16().count(), 9, "fixture: 9 UTF-16 units");
+
+        let server = server_with_doc(&uri, line);
+        let diagnostic = server
+            .convert_violation_to_diagnostic(&violation(1, 1, "UnusedLocalVariable"), &uri)
+            .await
+            .expect("violation should convert");
+
+        assert_eq!(
+            diagnostic.range.end.line, 0,
+            "single-line range stays on line 0"
+        );
+        assert_eq!(diagnostic.range.end.character, 9);
+    }
+
+    #[tokio::test]
+    async fn different_line_end_char_uses_end_line_utf16_length() {
+        // Multi-line violation whose end line differs from the start line and
+        // carries a non-ASCII char. `end_char` must come from the *end* line's
+        // UTF-16 length (9), not the start line's length (7) and not the 999
+        // not-found fallback.
+        let uri = Url::parse("file:///test.php").unwrap();
+        let content = "$x = 1;\n  café();";
+        let start_line = "$x = 1;";
+        let end_line = "  café();";
+        assert_eq!(
+            start_line.encode_utf16().count(),
+            7,
+            "fixture: start is 7 units"
+        );
+        assert_eq!(
+            end_line.encode_utf16().count(),
+            9,
+            "fixture: end is 9 units"
+        );
+        assert_eq!(end_line.len(), 10, "fixture: end is 10 bytes");
+
+        let server = server_with_doc(&uri, content);
+        let diagnostic = server
+            .convert_violation_to_diagnostic(&violation(1, 2, "UnusedLocalVariable"), &uri)
+            .await
+            .expect("violation should convert");
+
+        assert_eq!(diagnostic.range.end.line, 1, "end uses the second line");
+        assert_eq!(diagnostic.range.end.character, 9);
+    }
+
+    #[tokio::test]
+    async fn non_eco_start_char_is_utf16_offset_of_first_non_whitespace() {
+        // Non-`ErrorControlOperator` violation. The start line's leading
+        // whitespace is a non-breaking space (U+00A0, 2 bytes / 1 UTF-16 unit)
+        // followed by two ASCII spaces, so the whitespace byte length (4)
+        // exceeds its UTF-16 length (3). The é after it keeps the line
+        // non-ASCII. The non-ECO `start_char` branch must report the UTF-16
+        // offset of the first non-whitespace char (`c`) — 3, not the byte
+        // offset 4.
+        let uri = Url::parse("file:///test.php").unwrap();
+        let line = "\u{00A0}  café();";
+        let ws_bytes = line.len() - line.trim_start().len();
+        assert_eq!(ws_bytes, 4, "fixture: leading whitespace is 4 bytes");
+        assert_eq!(
+            line[..ws_bytes].encode_utf16().count(),
+            3,
+            "fixture: leading whitespace is 3 UTF-16 units"
+        );
+
+        let server = server_with_doc(&uri, line);
+        let diagnostic = server
+            .convert_violation_to_diagnostic(&violation(1, 1, "UnusedLocalVariable"), &uri)
+            .await
+            .expect("violation should convert");
+
+        assert_eq!(diagnostic.range.start.character, 3);
+    }
 }
