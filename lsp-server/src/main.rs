@@ -1,10 +1,12 @@
 use anyhow::Result;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::io::{stdin, stdout};
 use tokio::process::Command as ProcessCommand;
@@ -56,6 +58,60 @@ struct PhpmdLanguageServer {
     workspace_root: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
     // Limit concurrent PHPMD processes to prevent system overload
     process_semaphore: std::sync::Arc<Semaphore>,
+}
+
+/// Matches the true line number PHPMD embeds in a violation description, e.g.
+/// "Remove error control operator '@' on line 264." — the reported
+/// `beginLine`/`endLine` span the enclosing method, but the description points
+/// at the real offending line.
+static ON_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"on line (\d+)").expect("on-line regex is valid"));
+
+/// Parse the actual line number from a PHPMD violation description using the
+/// `on line N` pattern. Returns `None` when the description carries no such
+/// marker.
+fn parse_line_from_description(description: &str) -> Option<u32> {
+    ON_LINE_RE
+        .captures(description)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+}
+
+/// Determine the highlight range for an `ErrorControlOperator` violation.
+///
+/// PHPMD reports this rule with `beginLine`/`endLine` spanning the enclosing
+/// method, so the default range logic underlines the whole method body. The
+/// description, however, embeds the real operator line ("… on line N."). When
+/// that line can be recovered the range collapses to that single line;
+/// otherwise it falls back to the first reported line rather than propagating
+/// the full method span.
+fn error_control_operator_range(description: &str, begin_line: u32) -> (u32, u32) {
+    match parse_line_from_description(description) {
+        Some(line) => (line, line),
+        None => (begin_line, begin_line),
+    }
+}
+
+/// Locate the column at which the `@` operator begins on the given line so the
+/// squiggle underlines the operator token rather than the leading whitespace.
+/// Falls back to the first non-whitespace column when the line contains no `@`.
+fn error_control_operator_start_char(line_content: &str) -> usize {
+    match line_content.find('@') {
+        Some(offset) => offset,
+        None => line_content.len() - line_content.trim_start().len(),
+    }
+}
+
+/// Truncate a line to at most `max` characters for debug logging, appending an
+/// ellipsis when the line is longer. Truncation happens on character
+/// boundaries (not byte indices), so lines containing multi-byte UTF-8 (accents,
+/// CJK, emoji) never panic the way a raw `&line[..max]` byte slice would.
+fn truncate_for_log(line: &str, max: usize) -> String {
+    if line.chars().count() > max {
+        format!("{}...", line.chars().take(max).collect::<String>())
+    } else {
+        line.to_string()
+    }
 }
 
 impl PhpmdLanguageServer {
@@ -561,11 +617,7 @@ impl PhpmdLanguageServer {
         let raw_output = String::from_utf8_lossy(&output.stdout);
 
         // Debug: Show raw PHPMD output (first 500 chars)
-        let output_preview = if raw_output.len() > 500 {
-            format!("{}...", &raw_output[..500])
-        } else {
-            raw_output.to_string()
-        };
+        let output_preview = truncate_for_log(&raw_output, 500);
         eprintln!(
             "🔬 PHPMD LSP: Raw PHPMD output for {}: {}",
             file_name, output_preview
@@ -967,6 +1019,18 @@ impl PhpmdLanguageServer {
             // Exit/Eval expressions - just that line
             "ExitExpression" | "EvalExpression" => (begin_line, begin_line),
 
+            // Error control operator (@): PHPMD reports the enclosing method's
+            // range, but the description points at the real operator line.
+            // Collapse to that single line; fall back to the first reported
+            // line when the description can't be parsed.
+            "ErrorControlOperator" => {
+                let description = violation
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                error_control_operator_range(description, begin_line)
+            }
+
             // Default: If the range is very large (likely a class/method), limit it
             _ => {
                 // If the range spans more than 10 lines, it's likely a block-level issue
@@ -1072,13 +1136,7 @@ impl PhpmdLanguageServer {
                     if (effective_begin_line as usize) <= lines.len() && effective_begin_line > 0 {
                         let phpmd_line_content = lines
                             .get((effective_begin_line - 1) as usize)
-                            .map(|l| {
-                                if l.len() > 80 {
-                                    format!("{}...", &l[..80])
-                                } else {
-                                    l.to_string()
-                                }
-                            })
+                            .map(|l| truncate_for_log(l, 80))
                             .unwrap_or_else(|| "LINE NOT FOUND".to_string());
                         eprintln!(
                             "📍 PHPMD LSP: [{}] Content at PHPMD line {}: {:?}",
@@ -1089,9 +1147,14 @@ impl PhpmdLanguageServer {
                     // Calculate start and end character positions
                     if (effective_begin_line as usize) <= lines.len() && effective_begin_line > 0 {
                         let start_line_content = lines[(effective_begin_line - 1) as usize];
-                        // Find first non-whitespace character
-                        let start_char =
-                            start_line_content.len() - start_line_content.trim_start().len();
+                        // Find the start character. For ErrorControlOperator,
+                        // anchor the squiggle at the `@` token; otherwise use
+                        // the first non-whitespace character.
+                        let start_char = if rule == "ErrorControlOperator" {
+                            error_control_operator_start_char(start_line_content)
+                        } else {
+                            start_line_content.len() - start_line_content.trim_start().len()
+                        };
 
                         // Calculate end character position
                         let end_char = if lsp_begin_line == lsp_end_line {
@@ -1842,4 +1905,98 @@ async fn main() -> Result<()> {
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_line_number_from_description() {
+        let description = "Remove error control operator '@' on line 264.";
+        assert_eq!(parse_line_from_description(description), Some(264));
+    }
+
+    #[test]
+    fn returns_none_when_description_has_no_line_marker() {
+        let description = "The method openGzipFile() uses an error control operator.";
+        assert_eq!(parse_line_from_description(description), None);
+    }
+
+    #[test]
+    fn collapses_multi_line_method_span_to_description_line() {
+        // PHPMD reports beginLine/endLine spanning the whole enclosing method
+        // (line 260 through 290), but the description points at the real
+        // operator line. These values become the diagnostic's start.line and
+        // end.line, so they must be equal and match the parsed line.
+        let description = "Remove error control operator '@' on line 264.";
+        let begin_line = 260;
+        let end_line = 290;
+        assert!(end_line - begin_line > 10, "fixture must span a method");
+
+        let (start_line, range_end_line) = error_control_operator_range(description, begin_line);
+
+        assert_eq!(start_line, range_end_line);
+        assert_eq!(start_line, 264);
+    }
+
+    #[test]
+    fn falls_back_to_begin_line_when_description_unparsable() {
+        let description = "Some message without a line reference.";
+        let begin_line = 260;
+        assert_eq!(
+            error_control_operator_range(description, begin_line),
+            (begin_line, begin_line)
+        );
+    }
+
+    #[test]
+    fn start_char_anchors_at_the_at_operator() {
+        let line = "        $handle = @gzopen($path, 'wb9');";
+        let at_offset = line.find('@').unwrap();
+        assert_eq!(error_control_operator_start_char(line), at_offset);
+    }
+
+    #[test]
+    fn start_char_falls_back_to_first_non_whitespace_without_at() {
+        let line = "        $handle = gzopen($path, 'wb9');";
+        // 8 leading spaces, then the first non-whitespace character.
+        assert_eq!(error_control_operator_start_char(line), 8);
+    }
+
+    #[test]
+    fn truncate_for_log_leaves_short_lines_untouched() {
+        let line = "$handle = @gzopen($path, 'wb9');";
+        assert_eq!(truncate_for_log(line, 80), line.to_string());
+    }
+
+    #[test]
+    fn truncate_for_log_appends_ellipsis_when_too_long() {
+        let line = "x".repeat(120);
+        let result = truncate_for_log(&line, 80);
+        assert_eq!(result, format!("{}...", "x".repeat(80)));
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_multibyte_at_byte_boundary() {
+        // Regression for the `&line[..80]` byte slice: this line is 81 bytes
+        // ("a" + 40 × "é"), so the old byte-length guard (`len() > 80`) fired,
+        // but byte index 80 falls in the middle of the final "é" — not a char
+        // boundary — which panicked the LSP server. The char count (41) is
+        // ≤ 80, so the line should be returned in full without truncation.
+        let line = format!("a{}", "é".repeat(40));
+        assert!(line.len() > 80, "fixture must exceed 80 bytes");
+        assert!(line.chars().count() <= 80, "fixture must be ≤ 80 chars");
+        assert_eq!(truncate_for_log(&line, 80), line);
+    }
+
+    #[test]
+    fn truncate_for_log_truncates_multibyte_on_char_boundary() {
+        // 100 multi-byte chars (200 bytes): char count > 80, so it truncates.
+        // The result must be valid UTF-8 cut on a char boundary, not a byte one.
+        let line = "é".repeat(100);
+        let result = truncate_for_log(&line, 80);
+        assert_eq!(result, format!("{}...", "é".repeat(80)));
+        assert_eq!(result.chars().count(), 83); // 80 chars + "..."
+    }
 }
