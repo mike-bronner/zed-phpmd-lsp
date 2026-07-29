@@ -20,7 +20,7 @@ jobs:
         new_commit_sha: ${{ steps.commit_changes.outputs.new_commit_sha }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           token: ${{ env.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -173,7 +173,7 @@ jobs:
       # Pin to the version-bump commit: update-version force-moves the release
       # tag, and a bare checkout of the moved tag fails actions/checkout's
       # expected-commit validation.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.update-version.outputs.new_commit_sha }}
 
@@ -246,7 +246,7 @@ jobs:
 
     steps:
       # Pin to the version-bump commit — same race as build-lsp-server.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.update-version.outputs.new_commit_sha }}
 
@@ -286,7 +286,7 @@ jobs:
       - build-lsp-server
       - update-version
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
 
